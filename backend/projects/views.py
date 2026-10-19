@@ -5,7 +5,12 @@ from django.db import connection
 from users.serializers import UserSerializer
 from .models import Project, Membership, Task
 from .serializers import ProjectDetailSerializer, TaskSerializer
+import os
 
+from pyairtable import Api
+import logging
+
+logger = logging.getLogger(__name__)
 
 def _get_membership(user, project_id):
     try:
@@ -164,10 +169,19 @@ class TaskListCreateView(APIView):
 class TaskDetailView(APIView):
     def patch(self, request, task_id):
         try:
-            task = Task.objects.get(id=task_id)
+            # task = Task.objects.get(id=task_id)
+            task = Task.objects.select_related('project').get(id=task_id)
         except Task.DoesNotExist:
             return Response({'error': 'not found'}, status=status.HTTP_404_NOT_FOUND)
-
+        membership = Membership.objects.filter(project=task.project,user=request.user).first()
+        if membership is None:
+            return Response(
+                {
+                    "error": "You are not a project member"
+                },status=status.HTTP_403_FORBIDDEN
+            )
+        if membership.role not in ('admin','member'):
+            return Response({"error": 'You do not have permission to update tasks'}, status=status.HTTP_403_FORBIDDEN)
         if 'title' in request.data:
             task.title = request.data['title'].strip()
         if 'description' in request.data:
@@ -234,10 +248,91 @@ class MemberAddView(APIView):
 class ExportView(APIView):
     def post(self, request, project_id):
         membership = _get_membership(request.user, project_id)
-        if not membership:
-            return Response({'error': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
-        if not _can_edit_tasks(membership.role):
-            return Response({'error': 'only admins and members can export'}, status=status.HTTP_403_FORBIDDEN)
 
-        tasks = Task.objects.filter(project_id=project_id).select_related('assignee', 'created_by')
-        return Response({'exported': 0, 'tasks': TaskSerializer(tasks, many=True).data})
+        if not membership:
+            return Response(
+                {"error": "forbidden"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not _can_edit_tasks(membership.role):
+            return Response(
+                {"error": "only admins and members can export"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        api_key = os.environ.get("AIRTABLE_API_KEY")
+        base_id = os.environ.get("AIRTABLE_BASE_ID")
+        table_name = os.environ.get("AIRTABLE_TABLE_NAME", "Tasks")
+
+        if not api_key or not base_id:
+            return Response(
+                {"error": "Airtable is not configured"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        tasks = Task.objects.filter(
+            project_id=project_id
+        ).select_related("assignee", "created_by")
+
+        try:
+            table = Api(api_key).table(base_id, table_name)
+
+            # Read existing IDs so repeated exports don't duplicate records.
+            existing_records = table.all(
+                fields=["Task ID"]
+            )
+            existing_ids = {
+                str(record["fields"]["Task ID"])
+                for record in existing_records
+                if record.get("fields", {}).get("Task ID") is not None
+            }
+
+            exported = 0
+            failed = []
+
+            for task in tasks:
+                task_id = str(task.id)
+
+                if task_id in existing_ids:
+                    continue
+
+                fields = {
+                    "Task ID": task_id,
+                    "Title": task.title,
+                    "Description": task.description or "",
+                    "Status": {
+                        'todo': "Todo",
+                        'in_progress': "In progress",
+                        'review': "Review",
+                        'done': "Done",
+                    }.get(task.status, task.status),
+                    "Project ID": str(task.project_id),
+                    "Assignee": (
+                        task.assignee.email if task.assignee else ""
+                    ),
+                }
+
+                try:
+                    table.create(fields)
+                    existing_ids.add(task_id)
+                    exported += 1
+                except Exception:
+                    logger.exception(
+                        "Airtable export failed for task %s", task_id
+                    )
+                    failed.append(task_id)
+
+            return Response({
+                "exported": exported,
+                "skipped": len(existing_ids) - exported,
+                "failed_task_ids": failed,
+            })
+
+        except Exception:
+            logger.exception("Airtable export failed for project %s", project_id)
+            return Response(
+                {"error": "Unable to export tasks to Airtable"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+

@@ -7,9 +7,17 @@
     "jsx": "react-jsx",
     "strict": true,
     "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["vite/client","node"],
     "paths": {
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/*.spec.ts",
+    "src/**/*.spec.tsx",
+  ]
 }

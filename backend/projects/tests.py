@@ -85,6 +85,21 @@ class TestTasks:
 
         response = client.post(f'/api/projects/{project.id}/tasks', {'title': 'A task'}, format='json')
         assert response.status_code == 403
+    
+    def test_viewers_cannot_update_tasks(self,client, user):
+        owner = User.objects.create_user(email='owner@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='Update test project', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        Membership.objects.create(user=user, project=project, role='viewer')
+
+        task = Task.objects.create(project=project, title="Original title", created_by=owner)
+        resp = client.post('/api/auth/login', {'email': user.email, 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.patch(f'/api/tasks/{task.id}', {'title': 'Unauthorized update test'}, format='json')
+        assert response.status_code == 403
+        task.refresh_from_db()
+        assert task.title == "Original title"
 
     def test_delete_task_requires_membership(self, client, user):
         owner = User.objects.create_user(email='owner@example.com', name='Owner', password='password123')
@@ -97,3 +112,4 @@ class TestTasks:
 
         response = client.delete(f'/api/tasks/{task.id}')
         assert response.status_code == 403
+
